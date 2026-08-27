@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+logs/
+*.log
+venv/
+.venv/
+*.bak-*
+state.json
+last_room.txt
+panel_auth.json
