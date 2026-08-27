@@ -1,33 +1,34 @@
 {
-  "duck_delay_ms": 200,
-  "duck_fade_ms": 100,
-  "unduck_fade_ms": 200,
+  "duck_delay_ms": 700,
+  "duck_fade_ms": 1000,
+  "unduck_fade_ms": 1300,
   "voice_id": 1,
-  "tts_volume": 140,
+  "tts_volume": 120,
   "tts_normalize": true,
   "tts_eq": true,
-  "tts_speed": 80,
-  "tts_sdp": 45,
-  "tts_noise": 50,
-  "tts_emotion": "normal",
-  "gap_min_ms": 200,
+  "tts_speed": 90,
+  "tts_sdp": 35,
+  "tts_noise": 43,
+  "tts_emotion": "happy",
+  "gap_min_ms": 250,
   "gap_max_ms": 600,
   "user_cooldown": 15.0,
   "rag_enabled": true,
   "llm_main": {
     "base_url": "http://127.0.0.1:8002/v1",
-    "model": "deepseek-ai/DeepSeek-V4-Flash",
-    "api_key": "EMPTY"
+    "model": "MiniMaxAI/MiniMax-M3",
+    "api_key": ""
   },
   "llm_backup": {
-    "base_url": "http://127.0.0.1:8002/v1",
-    "model": "google/gemini-3.5-flash-lite",
+    "base_url": "http://192.168.5.100:8301/v1",
+    "model": "openai/gpt-oss-120b",
     "api_key": "EMPTY"
   },
-  "system_prompt": "你是一家水晶直播间的助播，替主播生成对着观众说的口播回复。",
+  "system_prompt": "你是东海本地的水晶主播，每次不3句话，每句话不超12个字，包括商品、价格和催单",
   "reply_include_nick": true,
   "reply_echo_danmu": true,
   "scene_enabled": true,
   "scene_switch_delay_s": 15,
-  "scene_hold_s": 180
+  "scene_hold_s": 180,
+  "filter_emoji": true
 }

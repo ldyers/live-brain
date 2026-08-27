@@ -62,6 +62,7 @@ DEFAULT_CONFIG = {
     "tts_emotion": "normal",    # normal/happy/angry/sad/experiment(实验通道)
     "gap_min_ms": 250,          # 句间最小停顿ms
     "gap_max_ms": 700,          # 句间最大停顿ms
+    "filter_emoji": True,       # 过滤纯表情弹幕(emoji/淘宝表情码/礼物计数)
     "user_cooldown": 15,     # 同一观众N秒内只回一条
     "rag_enabled": True,     # 是否查询知识库增强回复
     "llm_main": {            # 主模型
@@ -168,6 +169,19 @@ LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\[用户发言\](.*
 IGNORE_TEXTS = {"6", "66", "666", "6666", "哈哈", "哈哈哈", "来了", "签到"}
 # 控制字符/零宽字符: 真实弹幕里混入会导致下游JSON解析422
 CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200b-\u200f\u2028\u2029\u2060\ufeff]")
+# ---- 表情弹幕过滤(2026-08-27): 剥离纯表情类弹幕, 只留有实际内容的发言 ----
+EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F900-\U0001F9FF"
+    "\U00002B00-\U00002BFF\U0001F1E6-\U0001F1FF\uFE0F\u2b50\u3030\u303d\u3297\u3299\u2705\u274c]"
+)
+TAOBAO_FACE_RE = re.compile(r"\[-?[^][]*\]")      # 淘宝方括号表情码: [666] [-哈哈哈] [-鼓掌]
+GIFT_COUNTER_RE = re.compile(r"^[\s\U0001F000-\U0001FAFF]*(?:减|点|送|赞|亮了|收藏|分享)\s*[0-9０-９]*[\s.。!！]*$")  # 礼物互动计数噪音
+
+def effective_text(s):
+    """剥离表情后剩余的有效文本(用于判断是否纯表情弹幕)"""
+    s = TAOBAO_FACE_RE.sub("", s)
+    s = EMOJI_RE.sub("", s)
+    return CTRL_RE.sub("", s).strip()
 
 def clean_text(s):
     return CTRL_RE.sub("", s).strip()
@@ -180,7 +194,14 @@ def log(msg):
             f.write(line + "\n")
     except Exception:
         pass
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:                  # Windows GBK控制台遇emoji(2026-08-27): 降级输出防scan线程中断
+        try:
+            import sys
+            print(line.encode("gbk", "replace").decode("gbk"), flush=True)
+        except Exception:
+            pass
 
 def err(msg):
     log("ERROR: " + msg)
@@ -281,6 +302,14 @@ def handle_danmu(t, nick, text):
     with LOCK:
         STATE["seen"] += 1
         STATE["last_danmu"] = {"time": t, "nick": nick, "text": text}
+    # 表情弹幕过滤: 剥掉emoji/淘宝表情码/礼物计数后无实际内容 → 丢弃(不进RAG/LLM/TTS)
+    if CONFIG.get("filter_emoji", True):
+        eff = effective_text(text)
+        if not eff or len(eff) < 2 or GIFT_COUNTER_RE.match(eff):
+            with LOCK:
+                STATE["skip_emoji"] = STATE.get("skip_emoji", 0) + 1
+            log("filter-emoji: %s[%s]" % (nick[:12], text[:20]))
+            return
     if len(text) < 2 or text in IGNORE_TEXTS:
         with LOCK:
             STATE["skip_short"] += 1
@@ -388,6 +417,8 @@ def apply_config(d):
         CONFIG["tts_normalize"] = bool(d["tts_normalize"])
     if "tts_eq" in d:
         CONFIG["tts_eq"] = bool(d["tts_eq"])
+    if "filter_emoji" in d:
+        CONFIG["filter_emoji"] = bool(d["filter_emoji"])
     if isinstance(d.get("tts_emotion"), str) and d["tts_emotion"] in ("normal","happy","angry","sad","experiment"):
         CONFIG["tts_emotion"] = d["tts_emotion"]
     if CONFIG.get("gap_max_ms", 0) < CONFIG.get("gap_min_ms", 0):
@@ -424,7 +455,7 @@ SYSTEM_PROMPT = (
 LLM_STATE = {"use_backup": False, "fail_count": 0}   # 主模型连续失败>=2 切备用; 备用失败>=5 探测回主
 LLM_LOCK = threading.Lock()
 
-def _llm_chat_once(base_url, model, api_key, msgs):
+def _llm_chat_once(base_url, model, api_key, msgs, timeout=20):
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {"Content-Type": "application/json"}
     key = (api_key or "").strip()
@@ -438,13 +469,14 @@ def _llm_chat_once(base_url, model, api_key, msgs):
         payload[k] = v
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=20) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         d = json.loads(r.read().decode("utf-8"))
     reply = d["choices"][0]["message"]["content"].strip()
     for ch in "「」『』“”‘’\"'":
         reply = reply.replace(ch, "")
     reply = re.sub(r"\s+", " ", reply).strip()
-    return reply[:REPLY_MAXLEN]
+    actual = d.get("model") or model
+    return reply[:REPLY_MAXLEN], str(actual)
 
 def _pick_llm():
     """按故障状态选当前应使用的模型配置"""
@@ -509,9 +541,9 @@ def llm_reply(nick, text, knowledge):
     for attempt in range(3):                    # 单模型内重试(429/瞬时故障)
         cfg, is_bk = _pick_llm()
         try:
-            reply = _llm_chat_once(cfg["base_url"], cfg["model"], cfg.get("api_key", ""), msgs)
+            reply, actual_m = _llm_chat_once(cfg["base_url"], cfg["model"], cfg.get("api_key", ""), msgs)
             with LOCK:
-                STATE["llm_model"] = cfg["model"] + ("(备)" if is_bk else "")
+                STATE["llm_model"] = actual_m + ("(备)" if is_bk else "")
             _llm_report(True)
             return reply
         except Exception as e:
@@ -1376,6 +1408,8 @@ button.ghost{background:#334155;color:#cbd5e1}
 <input type="checkbox" id="tts_normalize"></div>
 <div class="row"><div><div class="lab">音质EQ</div><div class="hint">切低频浑浊+提2-4k清晰度, 对齐视频原声</div></div>
 <input type="checkbox" id="tts_eq"></div>
+<div class="row"><div><div class="lab">过滤表情弹幕</div><div class="hint">emoji/淘宝[-xx]表情码/礼物计数(减8·点23)不进LLM</div></div>
+<input type="checkbox" id="filter_emoji"></div>
 <div class="row"><div><div class="lab">语速</div><div class="hint">% 100=原速, 越大越快</div></div>
 <div style="display:flex;align-items:center;gap:10px;flex:1;max-width:330px">
 <input type="range" id="tts_speed" min="60" max="160" step="5" oninput="v2(this)"><span class="val" id="v_spd"></span></div></div>
@@ -1417,6 +1451,7 @@ async function load(){
  document.getElementById('tts_volume').value=c.tts_volume??130; v2(document.getElementById('tts_volume'));
  document.getElementById('tts_normalize').checked=c.tts_normalize!==false;
  document.getElementById('tts_eq').checked=c.tts_eq!==false;
+ document.getElementById('filter_emoji').checked=c.filter_emoji!==false;
  document.getElementById('tts_speed').value=c.tts_speed??100; v2(document.getElementById('tts_speed'));
  document.getElementById('tts_sdp').value=c.tts_sdp??30; v2(document.getElementById('tts_sdp'));
  document.getElementById('tts_noise').value=c.tts_noise??33; v2(document.getElementById('tts_noise'));
@@ -1439,6 +1474,7 @@ function collect(){
  o.tts_volume=+document.getElementById('tts_volume').value;
  o.tts_normalize=document.getElementById('tts_normalize').checked;
  o.tts_eq=document.getElementById('tts_eq').checked;
+ o.filter_emoji=document.getElementById('filter_emoji').checked;
  o.tts_speed=+document.getElementById('tts_speed').value;
  o.tts_sdp=+document.getElementById('tts_sdp').value;
  o.tts_noise=+document.getElementById('tts_noise').value;
@@ -1462,12 +1498,21 @@ async function save(){
  else{document.getElementById('tip').textContent='❌ 保存失败';}
 }
 async function testLlm(){
- document.getElementById('tip').textContent='⏳ 正在测试主模型…';
+ const btn=[...document.querySelectorAll('button')].find(b=>b.textContent.includes('测试当前主模型'));
+ const tip=document.getElementById('tip');
+ const old=btn?btn.textContent:'';
+ if(btn){btn.disabled=true;btn.textContent='⏳ 测试中…(最多15s)';}
+ tip.textContent='⏳ 正在测试主模型…';
+ const ctl=new AbortController(); const tid=setTimeout(()=>ctl.abort(),15000);
  try{
-  const r=await fetch('/api/llmtest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect())});
+  const r=await fetch('/api/llmtest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect()),signal:ctl.signal});
   const j=await r.json();
-  document.getElementById('tip').textContent=j.ok?('✅ 主模型连通: '+j.reply):('❌ 失败: '+j.error);
- }catch(e){document.getElementById('tip').textContent='❌ '+e;}
+  if(j.ok){
+   tip.textContent='✅ 主模型连通: '+j.reply+(j.note?(' '+j.note):'')+'（应答模型: '+j.actual_model+'）';
+  }else{tip.textContent='❌ 失败: '+j.error;}
+ }catch(e){tip.textContent=e.name==='AbortError'?'❌ 超时(15s): 主模型无响应, 高峰限流或地址不可达':'❌ '+e;}
+ clearTimeout(tid);
+ if(btn){btn.disabled=false;btn.textContent=old;}
 }
 function preset(a,b,c){[['duck_delay_ms',a],['duck_fade_ms',b],['unduck_fade_ms',c]].forEach(([k,v_])=>{const e=document.getElementById(k);e.value=v_;v(e,'d'+(F.indexOf(k)+1))})}
 function sc(cmd){
@@ -1574,9 +1619,11 @@ class Handler(BaseHTTPRequestHandler):
             if str(s.get("api_key") or "").strip():
                 slot["api_key"] = str(s["api_key"]).strip()
             try:
-                reply = _llm_chat_once(slot["base_url"], slot["model"], slot.get("api_key", ""),
-                                       [{"role": "user", "content": "回复两个字：正常"}])
-                return self._send(200, json.dumps({"ok": True, "reply": reply}, ensure_ascii=False))
+                reply, actual_m = _llm_chat_once(slot["base_url"], slot["model"], slot.get("api_key", ""),
+                                       [{"role": "user", "content": "回复两个字：正常"}], timeout=15)
+                same = actual_m == slot["model"]
+                note = "" if same else ("（⚠ 8002代理改写为 %s）" % actual_m)
+                return self._send(200, json.dumps({"ok": True, "reply": reply, "actual_model": actual_m, "note": note}, ensure_ascii=False))
             except Exception as e:
                 return self._send(200, json.dumps({"ok": False, "error": str(e)[:160]}, ensure_ascii=False))
         if u.path == "/api/config":
