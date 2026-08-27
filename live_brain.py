@@ -63,6 +63,8 @@ DEFAULT_CONFIG = {
     "gap_min_ms": 250,          # 句间最小停顿ms
     "gap_max_ms": 700,          # 句间最大停顿ms
     "filter_emoji": True,       # 过滤纯表情弹幕(emoji/淘宝表情码/礼物计数)
+    "reply_mode": "instant",    # 回复模式: instant=逐条即答 / smart=同人聚合(窗口内多条合并回复)
+    "agg_window_s": 6,          # 智能聚合窗口秒数(3~15): 首条弹幕起等N秒收集同观众后续弹幕
     "user_cooldown": 15,     # 同一观众N秒内只回一条
     "rag_enabled": True,     # 是否查询知识库增强回复
     "llm_main": {            # 主模型
@@ -293,6 +295,28 @@ def scan_once(mypath=None):
             handle_danmu(*parsed)
 
 # ---------------- 队列与过滤 ----------------
+# 智能聚合模式(2026-08-27): 同一观众窗口期内多条弹幕合并成一条再回复
+PENDING = {}          # nick -> {"texts": [..], "timer": threading.Timer}
+PENDING_LOCK = threading.Lock()
+
+def _flush_pending(nick):
+    """窗口到期: 把该观众缓冲的多条弹幕合并入队"""
+    with PENDING_LOCK:
+        ent = PENDING.pop(nick, None)
+    if not ent:
+        return
+    texts = ent["texts"]
+    if not texts:
+        return
+    if len(texts) == 1:
+        merged = texts[0]
+    else:
+        merged = " / ".join(texts)
+        with LOCK:
+            STATE["agg_merged"] = STATE.get("agg_merged", 0) + len(texts) - 1
+    log("agg-flush [%s]: %d条合并 => %s" % (nick[:12], len(texts), merged[:50]))
+    enqueue(nick, merged)
+
 def handle_danmu(t, nick, text):
     nick = clean_text(nick)
     text = clean_text(text)
@@ -320,6 +344,23 @@ def handle_danmu(t, nick, text):
             STATE["skip_dup"] += 1
         return
     now = time.time()
+    # 智能聚合模式: 同观众弹幕进缓冲窗, 窗尾合并回复; 即时模式: 直接入队(原逻辑)
+    if CONFIG.get("reply_mode", "instant") == "smart":
+        win = max(2.0, min(float(CONFIG.get("agg_window_s", 6)), 15.0))
+        with PENDING_LOCK:
+            ent = PENDING.get(nick)
+            if ent:
+                ent["texts"].append(text)
+                # 已有窗在跑: 弹幕追加, 窗口尾不变(首条起算)
+            else:
+                ent = {"texts": [text]}
+                timer = threading.Timer(win, _flush_pending, args=(nick,))
+                timer.daemon = True
+                ent["timer"] = timer
+                PENDING[nick] = ent
+                timer.start()
+        COOLDOWN[nick] = now
+        return
     last = COOLDOWN.get(nick, 0)
     if now - last < float(CONFIG.get("user_cooldown", USER_COOLDOWN)):
         with LOCK:
@@ -419,6 +460,9 @@ def apply_config(d):
         CONFIG["tts_eq"] = bool(d["tts_eq"])
     if "filter_emoji" in d:
         CONFIG["filter_emoji"] = bool(d["filter_emoji"])
+    if isinstance(d.get("reply_mode"), str) and d["reply_mode"] in ("instant", "smart"):
+        CONFIG["reply_mode"] = d["reply_mode"]
+    num("agg_window_s", 3, 15)
     if isinstance(d.get("tts_emotion"), str) and d["tts_emotion"] in ("normal","happy","angry","sad","experiment"):
         CONFIG["tts_emotion"] = d["tts_emotion"]
     if CONFIG.get("gap_max_ms", 0) < CONFIG.get("gap_min_ms", 0):
@@ -1419,6 +1463,14 @@ button.ghost{background:#334155;color:#cbd5e1}
 <input type="checkbox" id="tts_eq"></div>
 <div class="row"><div><div class="lab">过滤表情弹幕</div><div class="hint">emoji/淘宝[-xx]表情码/礼物计数(减8·点23)不进LLM</div></div>
 <input type="checkbox" id="filter_emoji"></div>
+<div class="row"><div><div class="lab">回复模式</div><div class="hint">即时=每条弹幕单独回; 智能聚合=同人窗口内多条合并成一条回复</div></div>
+<select id="reply_mode" style="background:#1b2437;color:#eee;border:1px solid #334;border-radius:6px;padding:6px 10px">
+<option value="instant">⚡ 即时（逐条回复）</option>
+<option value="smart">🧠 智能聚合（同人合并回复）</option>
+</select></div>
+<div class="row"><div><div class="lab">聚合窗口</div><div class="hint">秒。智能模式下首条弹幕起等N秒收集同人后续弹幕(3~15)</div></div>
+<div style="display:flex;align-items:center;gap:10px;flex:1;max-width:330px">
+<input type="range" id="agg_window_s" min="3" max="15" step="1" oninput="document.getElementById('v_aggw').textContent=this.value+' s'"><span class="val" id="v_aggw"></span></div></div>
 <div class="row"><div><div class="lab">语速</div><div class="hint">% 100=原速, 越大越快</div></div>
 <div style="display:flex;align-items:center;gap:10px;flex:1;max-width:330px">
 <input type="range" id="tts_speed" min="60" max="160" step="5" oninput="v2(this)"><span class="val" id="v_spd"></span></div></div>
@@ -1461,6 +1513,9 @@ async function load(){
  document.getElementById('tts_normalize').checked=c.tts_normalize!==false;
  document.getElementById('tts_eq').checked=c.tts_eq!==false;
  document.getElementById('filter_emoji').checked=c.filter_emoji!==false;
+ document.getElementById('reply_mode').value=c.reply_mode||'instant';
+ const aw=document.getElementById('agg_window_s'); aw.value=c.agg_window_s??6;
+ document.getElementById('v_aggw').textContent=aw.value+' s';
  document.getElementById('tts_speed').value=c.tts_speed??100; v2(document.getElementById('tts_speed'));
  document.getElementById('tts_sdp').value=c.tts_sdp??30; v2(document.getElementById('tts_sdp'));
  document.getElementById('tts_noise').value=c.tts_noise??33; v2(document.getElementById('tts_noise'));
@@ -1484,6 +1539,8 @@ function collect(){
  o.tts_normalize=document.getElementById('tts_normalize').checked;
  o.tts_eq=document.getElementById('tts_eq').checked;
  o.filter_emoji=document.getElementById('filter_emoji').checked;
+ o.reply_mode=document.getElementById('reply_mode').value;
+ o.agg_window_s=+document.getElementById('agg_window_s').value;
  o.tts_speed=+document.getElementById('tts_speed').value;
  o.tts_sdp=+document.getElementById('tts_sdp').value;
  o.tts_noise=+document.getElementById('tts_noise').value;
