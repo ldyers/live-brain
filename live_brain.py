@@ -461,17 +461,26 @@ def _llm_chat_once(base_url, model, api_key, msgs, timeout=20):
     key = (api_key or "").strip()
     if key and key != "EMPTY":
         headers["Authorization"] = "Bearer " + key
-    payload = {"model": model, "messages": msgs, "max_tokens": 80,
+    payload = {"model": model, "messages": msgs, "max_tokens": 400,
                "temperature": 0.8}
-    # 推理型模型(M3等): 关闭/压缩思维链, 只留最终答案
-    for k, v in (("reasoning_effort", "low"), ("enable_thinking", False),
+    # 推理型模型处理: OpenRouter类(glm-5.3-flash)强制推理→reasoning.max_tokens限思考+exclude;
+    # 注意reasoning_effort与reasoning.max_tokens互斥(400) → 只留max_tokens, 不发reasoning_effort
+    payload["reasoning"] = {"max_tokens": 120, "exclude": True}
+    for k, v in (("enable_thinking", False),
                  ("thinking", {"type": "disabled"}), ("chat_template_kwargs", {"thinking": False})):
         payload[k] = v
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         d = json.loads(r.read().decode("utf-8"))
-    reply = d["choices"][0]["message"]["content"].strip()
+    msg = (d.get("choices") or [{}])[0].get("message") or {}
+    # OpenRouter等: reasoning模型可能把内容放reasoning, content为null/空 → 回退拼接
+    reply = (msg.get("content") or "").strip()
+    if not reply:
+        reply = (msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+        reply = re.sub(r"\s+", " ", reply)[-REPLY_MAXLEN:]   # 兜底取末尾结论
+    if not reply:
+        raise RuntimeError("空回复(全部被推理消耗, max_tokens=80不足)")
     for ch in "「」『』“”‘’\"'":
         reply = reply.replace(ch, "")
     reply = re.sub(r"\s+", " ", reply).strip()
