@@ -1504,7 +1504,7 @@ function vgap(){const a=document.getElementById('gap_min_ms'),b=document.getElem
  if(+b.value<+a.value)b.value=a.value;
  document.getElementById('v_gmin').textContent=a.value+' ms';
  document.getElementById('v_gmax').textContent=b.value+' ms';}
-function v(el,id){document.getElementById(id).textContent=(el.id==='user_cooldown'?el.value+' s':el.value+' ms')}
+function v(el,id){const u=el.id.endsWith('_ms')?' ms':' s';let t=el.value+u;if(el.id==='scene_hold_s'&&+el.value>=60)t+=' (~'+(+el.value/60).toFixed(1)+'分)';document.getElementById(id).textContent=t}
 async function load(){
  const c=await (await fetch('/api/config')).json();
  F.forEach(k=>{const e=document.getElementById(k);e.value=c[k];v(e,'d'+(F.indexOf(k)+1))});
