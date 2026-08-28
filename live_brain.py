@@ -16,6 +16,7 @@ import sys
 import time
 import queue
 import struct
+import http.client
 import ctypes
 import socket
 import base64
@@ -1281,9 +1282,17 @@ button,input{border:none;border-radius:8px;padding:9px 18px;font-size:14px;curso
 input{background:#0f172a;color:#e2e8f0;border:1px solid #334155;cursor:text;width:260px}
 button.ghost{background:#334155;color:#cbd5e1}
 #tip{font-size:13px;color:#94a3b8;min-height:18px;margin-top:6px}
+.svc-entry{display:flex;gap:12px;margin:0 0 14px}
+.dot{font-size:16px;color:#64748b}
+.dot.on{color:#34d399}
+.dot.off{color:#f87171}
 </style></head><body><div class="wrap">
 <h1>🧠 直播大脑 <span id="badge" class="badge on">运行中</span></h1>
 <div class="sub">弹幕 → RAG+LLM → TTS → 自动播放 · 端口 __PORT__</div>
+<div class="svc-entry">
+<a href="http://127.0.0.1:23461/" target="_blank" style="text-decoration:none"><button class="ghost">📦 弹幕桥控制台 <span id="dot_tb" class="dot">·</span></button></a>
+<a href="http://127.0.0.1:7862/" target="_blank" style="text-decoration:none"><button class="ghost">🛡️ 实时驱虫控制台 <span id="dot_dd" class="dot">·</span></button></a>
+</div>
 <div class="grid">
 <div class="card"><div class="k">监控文件</div><div class="v" id="watch">-</div></div>
 <div class="card"><div class="k">待处理队列</div><div class="v" id="queue">0</div></div>
@@ -1336,6 +1345,11 @@ async function refresh(){
   tb.innerHTML=s.items.map(i=>'<tr><td>'+i.time+'</td><td>'+i.nick+'</td><td>'+i.danmu+
     '</td><td class="'+(i.ok?'ok':'fail')+'">'+(i.reply||'(失败)')+'</td><td>'+(i.ms/1000).toFixed(1)+'s'+
     (i.rag?' 📚':'')+'</td></tr>').join('')||'<tr><td colspan=5 class=mut>暂无</td></tr>';
+ }catch(e){}
+ try{
+  const h=await (await fetch('/api/svc_health')).json();
+  const set=(id,ok)=>{const d=document.getElementById(id);d.className='dot '+(ok?'on':'off');d.textContent=ok?'●':'●';};
+  set('dot_tb',h.tb); set('dot_dd',h.dedup);
  }catch(e){}
 }
 async function act(u){const r=await fetch(u);document.getElementById('tip').textContent=u+' => '+(await r.text());refresh()}
@@ -1620,6 +1634,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(snap, ensure_ascii=False))
             elif u.path == "/health":
                 self._send(200, "ok")
+            elif u.path == "/api/svc_health":
+                # 旁路服务在线探测(弹幕桥23461/实时驱虫7862), 供WebUI入口状态点
+                def _probe(port):
+                    try:
+                        c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+                        c.request("GET", "/")
+                        ok = c.getresponse().status < 500
+                        c.close()
+                        return ok
+                    except Exception:
+                        return False
+                self._send(200, json.dumps({"tb": _probe(23461), "dedup": _probe(7862)}))
             elif u.path == "/api/status":
                 with LOCK:
                     snap = {k: (list(v) if isinstance(v, deque) else v) for k, v in STATE.items()}
